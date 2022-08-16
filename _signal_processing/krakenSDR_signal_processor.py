@@ -348,7 +348,7 @@ class SignalProcessor(threading.Thread):
                                 i] and (i == self.output_vfo or self.output_vfo < 0):
                                 write_freq = int(self.vfo_freq[i])
                                 # Do channelization
-                                vfo_channel = channelize(self.processed_signal, freq, decimation_factor, sampling_freq)
+                                vfo_channel = channelize_v2(self.processed_signal, freq, decimation_factor, sampling_freq)
 
                                 ########################## Method to check IQ diffs when noise source forced ON
                                 # iq_diffs = calc_sync(self.processed_signal)
@@ -557,7 +557,7 @@ class SignalProcessor(threading.Thread):
         R = corr_matrix(processed_signal)  # de.corr_matrix_estimate(self.processed_signal.T, imp="fast")
 
         if self.en_DOA_FB_avg:
-            R = de.forward_backward_avg(R)
+            R = forward_backward_avg(R)
 
         M = self.channel_number
         scanning_vectors = []
@@ -841,6 +841,45 @@ def channelize(processed_signal, freq, decimation_factor, sampling_freq):
 
     # return decimated_signal
 
+# Get the frequency rotation exponential
+@jit(fastmath=True, cache=True, parallel=True)
+def get_exponential_v2(freq, sample_freq, sig_len):
+    # Auto shift peak frequency center of spectrum, this frequency will be decimated:
+    # https://pysdr.org/content/filters.html
+    f0 = -freq  # +10
+    Ts = 1.0 / sample_freq
+    t = np.arange(0.0, Ts * sig_len, Ts)
+    exponential = np.exp(2j * np.pi * f0 * t)  # this is essentially a complex sine wave
+    return np.ascontiguousarray(exponential)
+
+
+# Get taps of the lowpass FIR filter
+@lru_cache(maxsize=32)
+def get_lowpass_fir_filter_taps(decimation_factor: int) -> np.ndarray:
+    taps = np.ascontiguousarray(signal.firwin(20 * decimation_factor + 1, 1. / decimation_factor, window='hamming'))
+    return taps
+
+# This function takes the full data, and efficiently returns only a filtered and decimated requested channel
+def channelize_v2(processed_signal, freq, decimation_factor, sampling_freq):
+    input_signal = processed_signal.astype(np.complex128)
+
+    down_shift = get_exponential_v2(-freq, sampling_freq, len(processed_signal[0,:]))
+    down_shifted_signal = numba_mult(input_signal, down_shift)
+
+    # based on https://github.com/scipy/scipy/pull/16096 pull request
+    taps = get_lowpass_fir_filter_taps(decimation_factor)
+
+    axis = -1
+    sl = [slice(None)] * down_shifted_signal.ndim
+
+    y = signal.resample_poly(down_shifted_signal, 1, decimation_factor, axis=axis, window=taps)
+
+    decimated_signal = y[tuple(sl)]
+
+    up_shift = get_exponential_v2(freq, sampling_freq / decimation_factor, len(decimated_signal[0,:]))
+    output_signal = numba_mult(decimated_signal, up_shift)
+
+    return output_signal
 
 # NUMBA optimized MUSIC function. About 100x faster on the Pi 4
 # @njit(fastmath=True, cache=True, parallel=True)
@@ -883,6 +922,11 @@ def DOA_MUSIC(R, scanning_vectors, signal_dimension, angle_resolution=1):
 
     return ADORT
 
+# Forward-Backward Averaging
+# essentially assuming we have a single rf source
+@njit(fastmath=True, cache=True)
+def forward_backward_avg(R):
+    return 0.5 * (R + np.flip(R).conj())
 
 # Numba optimized version of pyArgus corr_matrix_estimate with "fast". About 2x faster on Pi4
 # @njit(fastmath=True, cache=True)

@@ -166,6 +166,11 @@ class SignalProcessor(threading.Thread):
         self.write_interval = 1
         self.last_write_time = [0] * self.max_vfos
 
+        # Output data
+        self.adc_overdrive = False
+        self.number_of_correlated_sources = []
+        self.snrs = []
+
     def resetPeakHold(self):
         if self.spectrum_fig_type == 'Single':
             self.peak_hold_spectrum = np.ones(self.spectrum_window_size) * -200
@@ -189,6 +194,8 @@ class SignalProcessor(threading.Thread):
 
                 # -----> ACQUIRE NEW DATA FRAME <-----
                 self.module_receiver.get_iq_online()
+                self.adc_overdrive = self.module_receiver.iq_header.adc_overdrive_flags
+
                 start_time = time.time()
 
                 # Check frame type for processing
@@ -290,6 +297,8 @@ class SignalProcessor(threading.Thread):
                             max_power_level_str_list = []
                             freq_list = []
                             doa_result_log_list = []
+                            self.number_of_correlated_sources.clear()
+                            self.snrs.clear()
 
                             for i in range(active_vfos):
                                 # If chanenl freq is out of bounds for the current tuned bandwidth, reset to the middle freq
@@ -442,7 +451,10 @@ class SignalProcessor(threading.Thread):
                                             write_freq,
                                             self.latitude,
                                             self.longitude,
-                                            self.heading)
+                                            self.heading,
+                                            self.adc_overdrive,
+                                            self.number_of_correlated_sources[0],
+                                            self.snrs[0])
                             elif self.DOA_data_format == "Kerberos App":
                                 self.wr_csv(self.station_id,
                                             DOA_str,
@@ -463,7 +475,10 @@ class SignalProcessor(threading.Thread):
                                              doa_result_log,
                                              self.latitude,
                                              self.longitude,
-                                             self.heading)
+                                             self.heading,
+                                             self.adc_overdrive,
+                                             self.number_of_correlated_sources[0],
+                                             self.snrs[0])
                             elif self.DOA_data_format == "Kraken Pro Remote":
                                 self.wr_json(self.station_id,
                                              DOA_str,
@@ -473,7 +488,10 @@ class SignalProcessor(threading.Thread):
                                              doa_result_log,
                                              self.latitude,
                                              self.longitude,
-                                             self.heading)
+                                             self.heading,
+                                             self.adc_overdrive,
+                                             self.number_of_correlated_sources[0],
+                                             self.snrs[0])
                             elif self.DOA_data_format == "RDF Mapper":
                                 epoch_time = int(time.time() * 1000)
 
@@ -518,7 +536,10 @@ class SignalProcessor(threading.Thread):
                                             'freq': str(write_freq),
                                             'anttype': self.DOA_ant_alignment,
                                             'latency': str(self.latency),
-                                            'doaarray': message
+                                            'doaarray': message,
+                                            'adc_overdrive': self.adc_overdrive,
+                                            'num_corr_sources': self.number_of_correlated_sources[0],
+                                            'snr_db': self.snrs[0]
                                     }
                                     try:
                                         # out = requests.post(self.RDF_mapper_server, data = rdf_post, timeout=5)
@@ -573,6 +594,13 @@ class SignalProcessor(threading.Thread):
         if self.en_DOA_FB_avg:
             R = de.forward_backward_avg(R)
 
+        # If rank of the correlation matrix is not equal to its full one,
+        # then we are likely dealing with correlated sources and (or) low SNR signals
+        number_of_correlated_sources = (R.shape[0] - np.linalg.matrix_rank(R))
+        self.number_of_correlated_sources.append(number_of_correlated_sources)
+
+        self.snrs.append(SNR(R))
+
         M = self.channel_number
         scanning_vectors = []
         frq_ratio = vfo_freq / self.module_receiver.daq_center_freq
@@ -612,6 +640,7 @@ class SignalProcessor(threading.Thread):
                 self.DOA[thetas[0:90].astype(int)] = min_val
                 self.DOA[thetas[270:360].astype(int)] = min_val
 
+
     # Enable GPS
     def enable_gps(self):
         if self.hasgps:
@@ -642,8 +671,8 @@ class SignalProcessor(threading.Thread):
             self.logger.error("Trying to use GPS, but can't connect to gpsd")
             self.gps_status = "Error"
 
-    def wr_xml(self, station_id, doa, conf, pwr, freq,
-               latitude, longitude, heading):
+    def wr_xml(self, station_id, doa, conf, pwr, freq, latitude, longitude,
+               heading, adc_overdrive, num_corr_sources, snr_db):
         # Kerberos-ify the data
         confidence_str = "{}".format(np.max(int(float(conf) * 100)))
         max_power_level_str = "{:.1f}".format((np.maximum(-100, float(pwr) + 100)))
@@ -661,6 +690,9 @@ class SignalProcessor(threading.Thread):
         xml_doa = ET.SubElement(data, 'DOA')
         xml_pwr = ET.SubElement(data, 'PWR')
         xml_conf = ET.SubElement(data, 'CONF')
+        xml_adc_overdrive = ET.SubElement(data, 'ADC_OVERDRIVE')
+        xml_num_corr_sources = ET.SubElement(data, 'NUM_CORRELATED_SOURCES')
+        xml_snr = ET.SubElement(data, 'SNR_DB')
 
         xml_st_id.text = str(station_id)
         xml_time.text = str(epoch_time)
@@ -671,6 +703,9 @@ class SignalProcessor(threading.Thread):
         xml_doa.text = doa
         xml_pwr.text = max_power_level_str
         xml_conf.text = confidence_str
+        xml_adc_overdrive.text = str(adc_overdrive)
+        xml_num_corr_sources.text = str(num_corr_sources)
+        xml_snr.text = str(snr_db)
 
         # create a new XML file with the results
         html_str = ET.tostring(data, encoding="unicode")
@@ -711,7 +746,8 @@ class SignalProcessor(threading.Thread):
             self.logger.debug("DoA results writen: {:s}".format(html_str))
 
     def wr_json(self, station_id, DOA_str, confidence_str, max_power_level_str,
-                freq, doa_result_log, latitude, longitude, heading):
+                freq, doa_result_log, latitude, longitude, heading,
+                adc_overdrive, num_corr_sources, snr_db):
         # KrakenSDR Flutter app out
         doaString = str('')
         for i in range(len(doa_result_log)):
@@ -724,6 +760,7 @@ class SignalProcessor(threading.Thread):
         #    doaString += ", " + "{:.2f}".format(doa_result_log[i])
 
         jsonDict = {}
+        jsonDict["station_id"] = station_id
         jsonDict["tStamp"] = int(time.time() * 1000)
         jsonDict["latitude"] = str(latitude)
         jsonDict["longitude"] = str(longitude)
@@ -735,6 +772,9 @@ class SignalProcessor(threading.Thread):
         jsonDict["antType"] = self.DOA_ant_alignment
         jsonDict["latency"] = 100
         jsonDict["doaArray"] = doaString
+        jsonDict["adc_overdrive"] = adc_overdrive
+        jsonDict["num_corr_sources"] = num_corr_sources
+        jsonDict["snr_db"] = snr_db
 
         try:
             r = self.pool.apply_async(requests.post, kwds={'url': 'http://127.0.0.1:8042/doapost', 'json': jsonDict})
@@ -939,6 +979,19 @@ def DOA_MUSIC(R, scanning_vectors, signal_dimension, angle_resolution=1):
         theta_index += 1
 
     return ADORT
+
+
+# Rather naive way to estimate SNR (in dBs) based on the assumption that largest and smallest eigenvalues
+# of the correlation matrix corresponds to the powers of the signal plus noise  and noise respectively.
+# Even though it won't estimate SNR beyond dominant signal, if it is already quite small,
+# then any additional signals have even lower SNR.
+def SNR(R: np.ndarray) -> float:
+    ev = np.abs(scipy.linalg.eigvals(R))
+    ev.sort()
+    noise_power = ev[0]
+    signal_plus_noise_power = ev[-1]
+    snr = 10.0 * np.log10((signal_plus_noise_power - noise_power) / noise_power)
+    return snr
 
 
 # Numba optimized version of pyArgus corr_matrix_estimate with "fast". About 2x faster on Pi4
